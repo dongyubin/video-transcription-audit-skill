@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.log
+
+.venv/
+venv/
+.env
+
+models/
+output/
+outputs/
+*.skill
