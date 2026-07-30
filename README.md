@@ -17,6 +17,11 @@
 - 保留 `raw/` 原始证据并记录哈希，校订不会覆盖原始转录。
 - 校验字幕连续性、时长覆盖、UTF-8、原始文件哈希和密钥泄漏。
 
+## 环境必备
+
+- [硅基流动 SiliconFlow](https://cloud.siliconflow.cn/i/DFpRRhZo)(实名获得 **¥16** 元代金券，有效期 **180** 天)
+- [TikHub](https://user.tikhub.io/register?ref=hHPxjjq2):在 TikTok、抖音、Instagram、X 等平台直接采集数据
+
 ## 自动后端选择
 
 使用 `--backend auto` 时按以下顺序选择：
