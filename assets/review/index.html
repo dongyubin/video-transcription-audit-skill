@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>字幕校订工作台</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="identity">
+        <span class="app-mark" aria-hidden="true">字</span>
+        <div>
+          <h1 id="run-title">字幕校订工作台</h1>
+          <p id="media-name">正在加载媒体…</p>
+        </div>
+      </div>
+      <div class="save-cluster">
+        <span id="save-status" class="save-status" role="status">载入中</span>
+        <button id="save-button" class="primary-command" type="button" disabled>
+          保存修改
+        </button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="media-pane" aria-label="媒体预览">
+        <div class="media-stage">
+          <video id="video" controls preload="metadata"></video>
+          <audio id="audio" controls preload="metadata"></audio>
+          <div id="subtitle-overlay" class="subtitle-overlay" aria-live="polite"></div>
+          <div id="media-empty" class="media-empty" hidden>当前为音频校订模式</div>
+        </div>
+        <div class="transport-bar">
+          <button id="previous-button" class="icon-command" type="button" title="上一条字幕" aria-label="上一条字幕">‹</button>
+          <button id="replay-button" class="icon-command" type="button" title="重听当前字幕" aria-label="重听当前字幕">↺</button>
+          <button id="next-button" class="icon-command" type="button" title="下一条字幕" aria-label="下一条字幕">›</button>
+          <label class="compact-control">
+            <span>速度</span>
+            <select id="speed-select">
+              <option value="0.5">0.5×</option>
+              <option value="0.75">0.75×</option>
+              <option value="1" selected>1×</option>
+              <option value="1.25">1.25×</option>
+              <option value="1.5">1.5×</option>
+              <option value="2">2×</option>
+            </select>
+          </label>
+          <label class="toggle-control">
+            <input id="loop-toggle" type="checkbox">
+            <span>循环当前字幕</span>
+          </label>
+          <output id="time-readout" class="time-readout">00:00.000 / 00:00.000</output>
+        </div>
+      </section>
+
+      <aside class="subtitle-pane" aria-label="字幕编辑">
+        <div class="list-tools">
+          <input id="search-input" type="search" placeholder="搜索字幕" aria-label="搜索字幕">
+          <label class="toggle-control unresolved-filter">
+            <input id="unresolved-toggle" type="checkbox">
+            <span>只看待确认</span>
+          </label>
+          <span id="cue-count" class="cue-count"></span>
+        </div>
+        <div id="cue-list" class="cue-list" role="listbox" aria-label="字幕列表"></div>
+        <div class="editor-pane">
+          <div class="editor-heading">
+            <div>
+              <span id="cue-number" class="cue-number">字幕 —</span>
+              <span id="cue-state" class="cue-state"></span>
+            </div>
+            <button id="confirm-button" class="confirm-command" type="button" disabled>
+              已听清并确认
+            </button>
+          </div>
+          <textarea id="cue-text" rows="4" aria-label="字幕文字" disabled></textarea>
+          <div class="time-fields">
+            <label>
+              <span>开始时间</span>
+              <input id="cue-start" type="number" min="0" step="0.001" disabled>
+            </label>
+            <label>
+              <span>结束时间</span>
+              <input id="cue-end" type="number" min="0" step="0.001" disabled>
+            </label>
+          </div>
+          <p id="validation-message" class="validation-message" role="alert"></p>
+        </div>
+      </aside>
+
+      <section class="timeline-pane" aria-label="字幕时间线">
+        <div class="timeline-heading">
+          <div>
+            <h2>波形时间线</h2>
+            <span id="timeline-detail">拖动字幕块可调整起止时间</span>
+          </div>
+          <label class="zoom-control">
+            <span>缩放</span>
+            <input id="zoom-slider" type="range" min="8" max="180" value="28">
+          </label>
+        </div>
+        <div id="waveform" class="waveform"></div>
+        <div id="timeline" class="timeline"></div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

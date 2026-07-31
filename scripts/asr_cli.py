@@ -19,9 +19,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -56,10 +58,92 @@ CUDA_COMPUTE_TYPE_ORDER = (
     "bfloat16",
     "float32",
 )
+EVIDENCE_DIR_NAME = "_审计证据"
+DELIVERY_TEXT_NAME = "01_转录文本.txt"
+DELIVERY_SRT_NAME = "02_字幕.srt"
+DELIVERY_REVIEW_NAME = "03_待确认内容.md"
+LEGACY_TEXT_NAME = "transcript.corrected.txt"
+LEGACY_SRT_NAME = "transcript.corrected.srt"
+AUDIT_REPORT_NAME = "transcript.audit.md"
+AUDIT_STATE_NAME = "audit.json"
+INPLACE_BACKUP_NAME = "._organize-backup"
+TRANSACTION_NAME = "transaction.json"
 
 
 class AsrError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class RunLayout:
+    root: Path
+    evidence_dir: Path
+    source_dir: Path
+    raw_dir: Path
+    audit_clips_dir: Path
+    run_path: Path
+    audit_path: Path
+    transcript_txt: Path
+    transcript_srt: Path
+    review_path: Path
+    legacy: bool
+
+
+def new_run_layout(run_dir: Path) -> RunLayout:
+    root = Path(run_dir).expanduser()
+    evidence = root / EVIDENCE_DIR_NAME
+    return RunLayout(
+        root=root,
+        evidence_dir=evidence,
+        source_dir=evidence / "source",
+        raw_dir=evidence / "raw",
+        audit_clips_dir=evidence / "audit-clips",
+        run_path=evidence / "run.json",
+        audit_path=evidence / AUDIT_REPORT_NAME,
+        transcript_txt=root / DELIVERY_TEXT_NAME,
+        transcript_srt=root / DELIVERY_SRT_NAME,
+        review_path=root / DELIVERY_REVIEW_NAME,
+        legacy=False,
+    )
+
+
+def legacy_run_layout(run_dir: Path) -> RunLayout:
+    root = Path(run_dir).expanduser()
+    return RunLayout(
+        root=root,
+        evidence_dir=root,
+        source_dir=root / "source",
+        raw_dir=root / "raw",
+        audit_clips_dir=root / "audit-clips",
+        run_path=root / "run.json",
+        audit_path=root / AUDIT_REPORT_NAME,
+        transcript_txt=root / LEGACY_TEXT_NAME,
+        transcript_srt=root / LEGACY_SRT_NAME,
+        review_path=root / DELIVERY_REVIEW_NAME,
+        legacy=True,
+    )
+
+
+def resolve_run_layout(run_dir: Path) -> RunLayout:
+    root = Path(run_dir).expanduser()
+    current = new_run_layout(root)
+    legacy = legacy_run_layout(root)
+    has_current = current.run_path.is_file()
+    has_legacy = legacy.run_path.is_file()
+    if has_current and has_legacy:
+        raise AsrError(
+            f"Conflicting run layouts found in {root}: both "
+            f"{EVIDENCE_DIR_NAME}/run.json and run.json exist."
+        )
+    if has_current:
+        return current
+    if has_legacy:
+        return legacy
+    raise AsrError(f"run.json not found: {root}")
+
+
+def relative_path(path: Path, base: Path) -> str:
+    return str(Path(os.path.relpath(str(path), str(base))))
 
 
 def eprint(*values: object) -> None:
@@ -1376,17 +1460,18 @@ def select_explicit_backend(
 
 
 def write_run_manifest(
-    output_dir: Path,
+    target: RunLayout | Path,
     run_data: dict[str, Any],
     raw_paths: dict[str, str],
 ) -> None:
     del raw_paths
+    layout = target if isinstance(target, RunLayout) else legacy_run_layout(target)
     hashes = {}
-    for item in (output_dir / "raw").rglob("*"):
+    for item in layout.raw_dir.rglob("*"):
         if item.is_file():
-            hashes[str(item.relative_to(output_dir))] = hash_file(item)
+            hashes[relative_path(item, layout.evidence_dir)] = hash_file(item)
     run_data["raw_hashes"] = hashes
-    json_write(output_dir / "run.json", run_data)
+    json_write(layout.run_path, run_data)
 
 
 def command_transcribe(args: argparse.Namespace) -> int:
@@ -1401,9 +1486,10 @@ def command_transcribe(args: argparse.Namespace) -> int:
         )
 
     require_media_tools()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    source_dir = output_dir / "source"
-    raw_dir = output_dir / "raw"
+    layout = new_run_layout(output_dir)
+    layout.root.mkdir(parents=True, exist_ok=True)
+    source_dir = layout.source_dir
+    raw_dir = layout.raw_dir
     source_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1456,30 +1542,37 @@ def command_transcribe(args: argparse.Namespace) -> int:
     stem = primary_stem(backend, selection["model"])
     raw_paths = write_bundle(raw_dir, stem, metadata, segments)
     run_data = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "input": str(source.resolve()),
-        "output_dir": str(output_dir.resolve()),
+        "output_dir": str(layout.root.resolve()),
         "normalized_audio": str(audio_path.resolve()),
         "duration_seconds": media["duration_seconds"],
         "language": args.language,
+        "layout": {
+            "version": 1,
+            "delivery_root": ".",
+            "evidence_root": EVIDENCE_DIR_NAME,
+        },
         "primary": {
             "backend": backend,
             "model": selection["model"],
             "device": selection["device"],
             "compute_type": selection["compute_type"],
             "timestamp_source": metadata.get("timestamp_source"),
-            "json": str(Path(raw_paths["json"]).relative_to(output_dir)),
-            "srt": str(Path(raw_paths["srt"]).relative_to(output_dir)),
-            "txt": str(Path(raw_paths["txt"]).relative_to(output_dir)),
+            "json": relative_path(Path(raw_paths["json"]), layout.evidence_dir),
+            "srt": relative_path(Path(raw_paths["srt"]), layout.evidence_dir),
+            "txt": relative_path(Path(raw_paths["txt"]), layout.evidence_dir),
         },
         "fallbacks": [],
         "audit_requested": bool(args.audit),
     }
-    write_run_manifest(output_dir, run_data, raw_paths)
+    write_run_manifest(layout, run_data, raw_paths)
+    write_delivery_outputs(layout, segments, set())
+    write_review_summary(layout, [], audited=False)
 
     if args.audit:
-        audit_args = argparse.Namespace(run_dir=str(output_dir), secondary="auto")
+        audit_args = argparse.Namespace(run_dir=str(layout.root), secondary="auto")
         command_prepare_audit(audit_args)
 
     print(
@@ -1739,17 +1832,18 @@ def transcribe_secondary_clip(
         }
 
 
-def conservative_outputs(
-    run_dir: Path,
+def write_delivery_outputs(
+    layout: RunLayout,
     segments: list[dict[str, Any]],
     suspect_ids: set[int],
 ) -> None:
     txt_lines = []
     srt_blocks = []
     for index, segment in enumerate(segments, start=1):
+        segment_id = int(segment.get("id") or index)
         text = (
             f"[听不清 {short_timestamp(segment['start'])}]"
-            if segment["id"] in suspect_ids
+            if segment_id in suspect_ids
             else segment["text"]
         )
         txt_lines.append(text)
@@ -1758,33 +1852,116 @@ def conservative_outputs(
             f"{format_timestamp(segment['start'])} --> "
             f"{format_timestamp(segment['end'])}\n{text}"
         )
-    (run_dir / "transcript.corrected.txt").write_text(
+    layout.transcript_txt.write_text(
         "\n".join(txt_lines) + "\n",
         encoding="utf-8",
     )
-    (run_dir / "transcript.corrected.srt").write_text(
+    layout.transcript_srt.write_text(
         "\n\n".join(srt_blocks) + "\n",
         encoding="utf-8",
     )
 
 
+def conservative_outputs(
+    run_dir: Path,
+    segments: list[dict[str, Any]],
+    suspect_ids: set[int],
+) -> None:
+    write_delivery_outputs(resolve_run_layout(run_dir), segments, suspect_ids)
+
+
+def write_review_summary(
+    layout: RunLayout,
+    audit_rows: list[dict[str, Any]],
+    *,
+    audited: bool,
+) -> None:
+    lines = ["# 待确认内容", ""]
+    if not audited:
+        lines.extend(
+            [
+                "- 状态：尚未执行多模型审计",
+                "- 当前文本和字幕来自主转录模型。",
+                "",
+                "如需定位低置信度内容，请运行 `prepare-audit`。",
+            ]
+        )
+    else:
+        unresolved = [
+            row
+            for row in audit_rows
+            if str(row.get("decision") or "").strip().lower().startswith("unresolved")
+        ]
+        if not unresolved:
+            lines.extend(
+                [
+                    "- 状态：审计完成",
+                    "- 待确认：0 处",
+                    "",
+                    "无需人工确认。",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "- 状态：审计完成",
+                    f"- 待确认：{len(unresolved)} 处",
+                    "",
+                    f"以下 {len(unresolved)} 处内容需要确认：",
+                ]
+            )
+            for index, row in enumerate(unresolved, start=1):
+                if row.get("time_range"):
+                    time_range = str(row["time_range"])
+                    start = time_range.split("–", 1)[0]
+                else:
+                    start = short_timestamp(float(row["start"]))
+                    end = short_timestamp(float(row["end"]))
+                    time_range = f"{start}–{end}"
+                reasons = row.get("reasons") or row.get("reason") or []
+                if isinstance(reasons, str):
+                    reason = reasons
+                else:
+                    reason = "；".join(str(item) for item in reasons)
+                decision = str(row.get("decision") or "")
+                markers = re.findall(r"\[听不清 [^\]]+\]", decision)
+                marker = "、".join(markers) if markers else f"[听不清 {start}]"
+                clip = str(row.get("clip") or "").replace("\\", "/")
+                clip_link = f"{EVIDENCE_DIR_NAME}/{clip}" if clip else ""
+                lines.extend(
+                    [
+                        "",
+                        f"## {index}. {time_range}",
+                        "",
+                        f"- 当前标记：`{marker}`",
+                        f"- 原因：{reason or '模型结果不一致'}",
+                        f"- 主模型候选：{row.get('primary') or '无'}",
+                        f"- 复核模型候选：{row.get('secondary') or '无'}",
+                    ]
+                )
+                if row.get("tertiary"):
+                    lines.append(f"- 第三模型候选：{row['tertiary']}")
+                if clip_link:
+                    lines.append(f"- 争议音频：[播放片段]({clip_link})")
+    layout.review_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def command_prepare_audit(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).expanduser()
-    run_path = run_dir / "run.json"
-    if not run_path.is_file():
-        raise AsrError(f"run.json not found: {run_dir}")
-    audit_path = run_dir / "transcript.audit.md"
+    layout = resolve_run_layout(run_dir)
+    run_path = layout.run_path
+    audit_path = layout.audit_path
     if audit_path.exists():
         raise AsrError(
             f"Audit already exists: {audit_path}. Use a new transcription run."
         )
 
     run_data = json_read(run_path)
-    primary_path = run_dir / run_data["primary"]["json"]
+    primary_path = layout.evidence_dir / run_data["primary"]["json"]
     primary_data = json_read(primary_path)
     segments = primary_data.get("segments") or []
     secondary_segments, secondary_full = collect_full_secondary(
-        run_dir,
+        layout.evidence_dir,
         run_data,
         segments,
         requested=args.secondary,
@@ -1813,8 +1990,9 @@ def command_prepare_audit(args: argparse.Namespace) -> int:
         duration=float(run_data["duration_seconds"]),
     )
     audio_path = Path(run_data["normalized_audio"])
-    clip_root = run_dir / "audit-clips"
+    clip_root = layout.audit_clips_dir
     audit_rows = []
+    segments_by_id = {int(segment["id"]): segment for segment in segments}
     for index, interval in enumerate(intervals, start=1):
         clip_dir = clip_root / f"{index:03d}"
         clip_path = clip_dir / "clip.mp3"
@@ -1834,6 +2012,11 @@ def command_prepare_audit(args: argparse.Namespace) -> int:
             clean_text(result.get("text", "")) + "\n",
             encoding="utf-8",
         )
+        markers = [
+            f"[听不清 {short_timestamp(segments_by_id[segment_id]['start'])}]"
+            for segment_id in interval["segment_ids"]
+            if segment_id in segments_by_id
+        ]
         audit_rows.append(
             {
                 "start": interval["start"],
@@ -1843,13 +2026,15 @@ def command_prepare_audit(args: argparse.Namespace) -> int:
                 "primary": " ".join(interval["primary_texts"]),
                 "secondary": clean_text(result.get("text", "")),
                 "secondary_backend": result.get("model") or result.get("backend"),
-                "clip": str(clip_path.relative_to(run_dir)),
+                "clip": relative_path(clip_path, layout.evidence_dir),
                 "error": result.get("error"),
+                "decision": "unresolved: "
+                + ", ".join(f"`{marker}`" for marker in markers),
             }
         )
 
     suspect_ids = {item["id"] for item in suspects}
-    conservative_outputs(run_dir, segments, suspect_ids)
+    write_delivery_outputs(layout, segments, suspect_ids)
 
     lines = [
         "# Transcript Audit",
@@ -1870,14 +2055,23 @@ def command_prepare_audit(args: argparse.Namespace) -> int:
         secondary = (row["secondary"] or row.get("error") or "").replace(
             "|", "\\|"
         ).replace("\n", " ")
-        marker = f"[听不清 {start}]"
         lines.append(
             f"| {start}–{end} | {reason} | {primary} | "
-            f"{secondary} | unresolved: `{marker}` |"
+            f"{secondary} | {row['decision']} |"
         )
     if not audit_rows:
         lines.append("| — | No automatic concerns | — | — | confirmed |")
     audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    json_write(
+        layout.evidence_dir / AUDIT_STATE_NAME,
+        {
+            "schema_version": 1,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "intervals": audit_rows,
+        },
+    )
+    if not layout.legacy:
+        write_review_summary(layout, audit_rows, audited=True)
 
     run_data["audit"] = {
         "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1889,8 +2083,9 @@ def command_prepare_audit(args: argparse.Namespace) -> int:
             {
                 "model": secondary_full["model"],
                 "alignment_ratio": round(secondary_full["alignment_ratio"], 4),
-                "json": str(
-                    Path(secondary_full["paths"]["json"]).relative_to(run_dir)
+                "json": relative_path(
+                    Path(secondary_full["paths"]["json"]),
+                    layout.evidence_dir,
                 ),
             }
             if secondary_full
@@ -1901,13 +2096,13 @@ def command_prepare_audit(args: argparse.Namespace) -> int:
         for path in secondary_full["paths"].values():
             item = Path(path)
             run_data.setdefault("raw_hashes", {})[
-                str(item.relative_to(run_dir))
+                relative_path(item, layout.evidence_dir)
             ] = hash_file(item)
     json_write(run_path, run_data)
     print(
         json.dumps(
             {
-                "run_dir": str(run_dir.resolve()),
+                "run_dir": str(layout.root.resolve()),
                 "suspect_segments": len(suspects),
                 "audit_intervals": len(audit_rows),
                 "unresolved": len(audit_rows),
@@ -1968,60 +2163,78 @@ def validate_srt(path: Path, duration: float) -> list[str]:
     return errors
 
 
-def command_validate(args: argparse.Namespace) -> int:
-    run_dir = Path(args.run_dir).expanduser()
-    run_path = run_dir / "run.json"
+def validate_run(run_dir: Path) -> dict[str, Any]:
+    layout = resolve_run_layout(Path(run_dir).expanduser())
+    run_path = layout.run_path
     errors: list[str] = []
     warnings: list[str] = []
-    if not run_path.is_file():
-        raise AsrError(f"run.json not found: {run_dir}")
     run_data = json_read(run_path)
 
     required = [
-        run_dir / run_data["primary"]["json"],
-        run_dir / run_data["primary"]["srt"],
-        run_dir / run_data["primary"]["txt"],
-        run_dir / "source" / "media.json",
+        layout.evidence_dir / run_data["primary"]["json"],
+        layout.evidence_dir / run_data["primary"]["srt"],
+        layout.evidence_dir / run_data["primary"]["txt"],
+        layout.source_dir / "media.json",
     ]
-    if run_data.get("audit_requested") or run_data.get("audit"):
+    audited = bool(run_data.get("audit_requested") or run_data.get("audit"))
+    if layout.legacy and audited:
         required.extend(
             [
-                run_dir / "transcript.corrected.txt",
-                run_dir / "transcript.corrected.srt",
-                run_dir / "transcript.audit.md",
+                layout.transcript_txt,
+                layout.transcript_srt,
+                layout.audit_path,
             ]
         )
+    elif not layout.legacy:
+        required.extend(
+            [
+                layout.transcript_txt,
+                layout.transcript_srt,
+                layout.review_path,
+            ]
+        )
+        if audited:
+            required.append(layout.audit_path)
     for path in required:
         if not path.is_file():
-            errors.append(f"Missing required file: {path.relative_to(run_dir)}")
+            errors.append(
+                f"Missing required file: {relative_path(path, layout.root)}"
+            )
 
     for relative, expected_hash in (run_data.get("raw_hashes") or {}).items():
-        path = run_dir / relative
+        path = layout.evidence_dir / relative
         if not path.is_file():
             errors.append(f"Raw evidence missing: {relative}")
         elif hash_file(path) != expected_hash:
             errors.append(f"Raw evidence changed: {relative}")
 
     srt_path = (
-        run_dir / "transcript.corrected.srt"
-        if (run_dir / "transcript.corrected.srt").is_file()
-        else run_dir / run_data["primary"]["srt"]
+        layout.transcript_srt
+        if layout.transcript_srt.is_file()
+        else layout.evidence_dir / run_data["primary"]["srt"]
     )
     if srt_path.is_file():
         errors.extend(validate_srt(srt_path, float(run_data["duration_seconds"])))
 
-    for path in run_dir.rglob("*"):
+    for path in layout.root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
             continue
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            errors.append(f"Not valid UTF-8: {path.relative_to(run_dir)}")
+            errors.append(
+                f"Not valid UTF-8: {relative_path(path, layout.root)}"
+            )
             continue
         if "\ufffd" in text:
-            errors.append(f"Replacement character found: {path.relative_to(run_dir)}")
+            errors.append(
+                "Replacement character found: "
+                f"{relative_path(path, layout.root)}"
+            )
         if SECRET_PATTERN.search(text):
-            errors.append(f"Possible API key leaked: {path.relative_to(run_dir)}")
+            errors.append(
+                f"Possible API key leaked: {relative_path(path, layout.root)}"
+            )
 
     timestamp_source = run_data["primary"].get("timestamp_source")
     if timestamp_source and timestamp_source != "native-word":
@@ -2034,10 +2247,358 @@ def command_validate(args: argparse.Namespace) -> int:
         "valid": not errors,
         "errors": errors,
         "warnings": warnings,
-        "run_dir": str(run_dir.resolve()),
+        "run_dir": str(layout.root.resolve()),
+        "layout": "legacy" if layout.legacy else "delivery-evidence",
     }
+    return result
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    result = validate_run(Path(args.run_dir))
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if not errors else 1
+    return 0 if result["valid"] else 1
+
+
+def split_markdown_row(line: str) -> list[str]:
+    if not line.startswith("|"):
+        return []
+    columns = re.split(r"(?<!\\)\|", line)
+    return [
+        item.strip().replace("\\|", "|")
+        for item in columns[1:-1]
+    ]
+
+
+def audit_rows_from_report(layout: RunLayout) -> list[dict[str, Any]]:
+    if not layout.audit_path.is_file():
+        return []
+    rows = []
+    for line in layout.audit_path.read_text(encoding="utf-8").splitlines():
+        columns = split_markdown_row(line)
+        if len(columns) != 5 or not re.match(r"^\d{2}:\d{2}:\d{2}", columns[0]):
+            continue
+        index = len(rows) + 1
+        clip = layout.audit_clips_dir / f"{index:03d}" / "clip.mp3"
+        tertiary_files = sorted(
+            (layout.audit_clips_dir / f"{index:03d}").glob(
+                "tertiary-*.txt"
+            )
+        )
+        tertiary = ""
+        if tertiary_files:
+            tertiary = tertiary_files[0].read_text(encoding="utf-8").strip()
+        rows.append(
+            {
+                "time_range": columns[0],
+                "reason": columns[1],
+                "primary": columns[2],
+                "secondary": columns[3],
+                "decision": columns[4],
+                "clip": (
+                    relative_path(clip, layout.evidence_dir)
+                    if clip.is_file()
+                    else ""
+                ),
+                "tertiary": tertiary,
+            }
+        )
+    return rows
+
+
+def remove_tree(path: Path) -> None:
+    if not path.exists():
+        return
+
+    def make_writable_and_retry(function, item, exc_info):
+        del exc_info
+        os.chmod(item, 0o700)
+        function(item)
+
+    shutil.rmtree(path, onerror=make_writable_and_retry)
+
+
+def validate_or_raise(run_dir: Path, *, stage: str) -> dict[str, Any]:
+    result = validate_run(run_dir)
+    if not result["valid"]:
+        details = "; ".join(result["errors"])
+        raise AsrError(f"{stage} validation failed: {details}")
+    return result
+
+
+def legacy_top_level_conflicts(layout: RunLayout) -> list[str]:
+    allowed = {
+        "source",
+        "raw",
+        "audit-clips",
+        "run.json",
+        AUDIT_REPORT_NAME,
+        LEGACY_TEXT_NAME,
+        LEGACY_SRT_NAME,
+    }
+    return sorted(
+        item.name
+        for item in layout.root.iterdir()
+        if item.name not in allowed
+    )
+
+
+def build_organized_staging(
+    legacy: RunLayout,
+    staging: RunLayout,
+    final_root: Path,
+) -> None:
+    staging.root.mkdir(parents=True, exist_ok=True)
+    staging.evidence_dir.mkdir(parents=True, exist_ok=True)
+    for source, destination in (
+        (legacy.source_dir, staging.source_dir),
+        (legacy.raw_dir, staging.raw_dir),
+        (legacy.audit_clips_dir, staging.audit_clips_dir),
+    ):
+        if source.exists():
+            shutil.copytree(source, destination, copy_function=shutil.copy2)
+    if legacy.audit_path.is_file():
+        shutil.copy2(legacy.audit_path, staging.audit_path)
+
+    run_data = json_read(legacy.run_path)
+    run_data["schema_version"] = max(int(run_data.get("schema_version") or 1), 2)
+    run_data["output_dir"] = str(final_root.resolve())
+    run_data["layout"] = {
+        "version": 1,
+        "delivery_root": ".",
+        "evidence_root": EVIDENCE_DIR_NAME,
+    }
+    normalized = staging.source_dir / "audio_16k.mp3"
+    if normalized.is_file():
+        run_data["normalized_audio"] = str(
+            (final_root / EVIDENCE_DIR_NAME / "source" / "audio_16k.mp3").resolve()
+        )
+    json_write(staging.run_path, run_data)
+
+    primary = run_data["primary"]
+    source_txt = (
+        legacy.transcript_txt
+        if legacy.transcript_txt.is_file()
+        else legacy.evidence_dir / primary["txt"]
+    )
+    source_srt = (
+        legacy.transcript_srt
+        if legacy.transcript_srt.is_file()
+        else legacy.evidence_dir / primary["srt"]
+    )
+    shutil.copy2(source_txt, staging.transcript_txt)
+    shutil.copy2(source_srt, staging.transcript_srt)
+
+    audited = bool(run_data.get("audit") or legacy.audit_path.is_file())
+    rows = audit_rows_from_report(legacy) if audited else []
+    write_review_summary(staging, rows, audited=audited)
+
+
+def remove_path(path: Path) -> None:
+    if path.is_dir():
+        remove_tree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def recover_in_place_transaction(root: Path) -> None:
+    backup = root / INPLACE_BACKUP_NAME
+    if not backup.is_dir():
+        return
+    current_manifest = root / EVIDENCE_DIR_NAME / "run.json"
+    if current_manifest.is_file():
+        try:
+            if validate_run(root)["valid"]:
+                remove_tree(backup)
+                return
+        except Exception:
+            pass
+    transaction_path = backup / TRANSACTION_NAME
+    transaction = (
+        json_read(transaction_path)
+        if transaction_path.is_file()
+        else {"new_names": []}
+    )
+    for name in transaction.get("new_names") or []:
+        remove_path(root / str(name))
+    for item in list(backup.iterdir()):
+        if item.name == TRANSACTION_NAME:
+            continue
+        destination = root / item.name
+        if destination.exists():
+            remove_path(item)
+        else:
+            item.rename(destination)
+    remove_tree(backup)
+
+
+def rename_root_for_swap(root: Path, backup: Path) -> None:
+    root.rename(backup)
+
+
+def move_entry(source: Path, destination: Path) -> None:
+    source.rename(destination)
+
+
+def commit_staging_in_place(root: Path, staging_root: Path) -> None:
+    backup = root / INPLACE_BACKUP_NAME
+    if backup.exists():
+        raise AsrError(f"Unfinished organize backup already exists: {backup}")
+    backup.mkdir()
+    old_items = [item for item in root.iterdir() if item != backup]
+    new_items = list(staging_root.iterdir())
+    json_write(
+        backup / TRANSACTION_NAME,
+        {
+            "old_names": [item.name for item in old_items],
+            "new_names": [item.name for item in new_items],
+        },
+    )
+    moved_old: list[tuple[Path, Path]] = []
+    moved_new: list[tuple[Path, Path]] = []
+    try:
+        for item in old_items:
+            destination = backup / item.name
+            move_entry(item, destination)
+            moved_old.append((destination, item))
+        for item in new_items:
+            destination = root / item.name
+            move_entry(item, destination)
+            moved_new.append((destination, item))
+        validate_or_raise(root, stage="Final organized run")
+        remove_tree(backup)
+    except Exception:
+        for current, original in reversed(moved_new):
+            if current.exists():
+                move_entry(current, original)
+        for current, original in reversed(moved_old):
+            if current.exists():
+                move_entry(current, original)
+        remove_tree(backup)
+        raise
+
+
+def commit_organized_staging(
+    root: Path,
+    staging_root: Path,
+    backup: Path,
+) -> None:
+    try:
+        rename_root_for_swap(root, backup)
+    except PermissionError:
+        commit_staging_in_place(root, staging_root)
+        return
+    failed_new: Path | None = None
+    try:
+        staging_root.rename(root)
+        validate_or_raise(root, stage="Final organized run")
+    except Exception:
+        if root.exists():
+            failed_new = root.parent / (
+                f".{root.name}.failed-{os.getpid()}-{time.time_ns()}"
+            )
+            root.rename(failed_new)
+        backup.rename(root)
+        raise
+    finally:
+        if failed_new:
+            remove_tree(failed_new)
+    remove_tree(backup)
+
+
+def organize_run(run_dir: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    root = Path(run_dir).expanduser()
+    recover_in_place_transaction(root)
+    current_manifest = root / EVIDENCE_DIR_NAME / "run.json"
+    legacy_manifest = root / "run.json"
+    if current_manifest.is_file() and legacy_manifest.is_file():
+        raise AsrError(
+            f"Conflicting run layouts found in {root}: both "
+            f"{EVIDENCE_DIR_NAME}/run.json and run.json exist."
+        )
+    if current_manifest.is_file():
+        validate_or_raise(root, stage="Existing organized run")
+        return {
+            "status": "already-organized",
+            "run_dir": str(root.resolve()),
+        }
+    if not legacy_manifest.is_file():
+        raise AsrError(f"run.json not found: {root}")
+
+    legacy = legacy_run_layout(root)
+    validate_or_raise(root, stage="Legacy run")
+    conflicts = legacy_top_level_conflicts(legacy)
+    if conflicts:
+        raise AsrError(
+            "Cannot organize a run with unknown top-level entries: "
+            + ", ".join(conflicts)
+        )
+    if dry_run:
+        return {
+            "status": "dry-run",
+            "run_dir": str(root.resolve()),
+            "delivery_files": [
+                DELIVERY_TEXT_NAME,
+                DELIVERY_SRT_NAME,
+                DELIVERY_REVIEW_NAME,
+            ],
+            "evidence_dir": EVIDENCE_DIR_NAME,
+        }
+
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f".{root.name}.organize-", dir=str(root.parent))
+    )
+    staging = new_run_layout(staging_root)
+    backup = root.parent / (
+        f".{root.name}.backup-{os.getpid()}-{time.time_ns()}"
+    )
+    try:
+        build_organized_staging(legacy, staging, root)
+        validate_or_raise(staging.root, stage="Staged organized run")
+        commit_organized_staging(root, staging.root, backup)
+        return {
+            "status": "organized",
+            "run_dir": str(root.resolve()),
+            "delivery_files": [
+                DELIVERY_TEXT_NAME,
+                DELIVERY_SRT_NAME,
+                DELIVERY_REVIEW_NAME,
+            ],
+            "evidence_dir": EVIDENCE_DIR_NAME,
+        }
+    finally:
+        if staging_root.exists():
+            remove_tree(staging_root)
+
+
+def command_organize(args: argparse.Namespace) -> int:
+    result = organize_run(Path(args.run_dir), dry_run=bool(args.dry_run))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_review(args: argparse.Namespace) -> int:
+    module_path = SCRIPT_DIR / "review_server.py"
+    if not module_path.is_file():
+        raise AsrError(f"Visual review module is missing: {module_path}")
+    module_name = "video_transcription_review_server"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if not spec or not spec.loader:
+        raise AsrError(f"Could not load visual review module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        assets_dir = SCRIPT_DIR.parent / "assets" / "review"
+        module.serve_review(
+            Path(args.run_dir),
+            assets_dir,
+            media_override=args.media,
+            port=args.port,
+            open_browser=not args.no_open,
+        )
+    except module.ReviewError as exc:
+        raise AsrError(str(exc)) from exc
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2098,6 +2659,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate = subparsers.add_parser("validate", help="Validate a transcription run.")
     validate.add_argument("run_dir")
+
+    organize = subparsers.add_parser(
+        "organize",
+        help="Migrate a legacy run into the delivery/evidence layout.",
+    )
+    organize.add_argument("run_dir")
+    organize.add_argument("--dry-run", action="store_true")
+
+    review = subparsers.add_parser(
+        "review",
+        help="Open the lightweight local video and subtitle review editor.",
+    )
+    review.add_argument("run_dir")
+    review.add_argument(
+        "--media",
+        help="Use this local audio/video file for the current review session.",
+    )
+    review.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Loopback port; 0 selects an available port.",
+    )
+    review.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Start the server without opening the default browser.",
+    )
     return parser
 
 
@@ -2131,6 +2720,10 @@ def main() -> int:
         return command_prepare_audit(args)
     if args.command == "validate":
         return command_validate(args)
+    if args.command == "organize":
+        return command_organize(args)
+    if args.command == "review":
+        return command_review(args)
     parser.error("Unknown command")
     return 2
 

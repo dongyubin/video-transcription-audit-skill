@@ -85,23 +85,35 @@ Expected outputs:
 
 ```text
 OUTPUT_DIR/
-├── source/
-│   ├── audio_16k.mp3
-│   └── media.json
-├── raw/
-│   ├── <primary>.json
-│   ├── <primary>.txt
-│   ├── <primary>.srt
-│   ├── <primary>.vtt
-│   └── <primary>.tsv
-├── audit-clips/
-├── transcript.corrected.txt
-├── transcript.corrected.srt
-├── transcript.audit.md
-└── run.json
+├── 01_转录文本.txt
+├── 02_字幕.srt
+├── 03_待确认内容.md
+└── _审计证据/
+    ├── source/
+    │   ├── audio_16k.mp3
+    │   └── media.json
+    ├── raw/
+    │   ├── <primary>.json
+    │   ├── <primary>.txt
+    │   ├── <primary>.srt
+    │   ├── <primary>.vtt
+    │   └── <primary>.tsv
+    ├── audit-clips/
+    ├── audit.json
+    ├── review/
+    │   ├── waveform.u8
+    │   ├── waveform.meta.json
+    │   └── edits.jsonl
+    ├── transcript.audit.md
+    └── run.json
 ```
 
-If the user wants a quick raw transcript, omit `--audit`. Run `prepare-audit` later:
+The three numbered files are the user delivery layer. `_审计证据/` is the
+technical evidence layer and normally does not need to be opened.
+
+If the user wants a quick raw transcript, omit `--audit`. The three delivery
+files are still created, and `03_待确认内容.md` clearly states that multi-model
+audit has not run. Run `prepare-audit` later:
 
 ```bash
 pwsh -File "{baseDir}/scripts/asr.ps1" prepare-audit "OUTPUT_DIR" --secondary auto
@@ -111,9 +123,44 @@ pwsh -File "{baseDir}/scripts/asr.ps1" prepare-audit "OUTPUT_DIR" --secondary au
 bash "{baseDir}/scripts/asr.sh" prepare-audit "OUTPUT_DIR" --secondary auto
 ```
 
+## Review Visually
+
+Open the local video, subtitles, waveform timeline, and correction controls:
+
+```bash
+pwsh -File "{baseDir}/scripts/asr.ps1" review "OUTPUT_DIR"
+```
+
+```bash
+bash "{baseDir}/scripts/asr.sh" review "OUTPUT_DIR"
+```
+
+The review server binds only to `127.0.0.1`, selects an available port, and
+opens the default browser. Use `--no-open` to print the URL without opening it,
+or `--port PORT` to select a loopback port. If the original media moved, use:
+
+```bash
+pwsh -File "{baseDir}/scripts/asr.ps1" review "OUTPUT_DIR" --media "VIDEO_FILE"
+```
+
+The selected media must match the transcription duration. The server references
+the original video and never copies it. If the original is missing, it falls
+back to `_审计证据/source/audio_16k.mp3`.
+
+The editor supports synchronized playback, subtitle overlay, search, unresolved
+filtering, playback speed, cue looping, text edits, and cue start/end changes.
+It does not add, remove, split, or merge cues. An unresolved interval remains
+unresolved after a text edit until the user explicitly chooses
+`已听清并确认`.
+
+WaveSurfer assets are bundled with the Skill and require no runtime network
+access. Per-run waveform data is cached under `_审计证据/review/` at 20 peaks
+per second, approximately 72 KB per hour. Every successful save appends a small
+entry to `edits.jsonl`; raw model evidence is never changed.
+
 ## Correct The Transcript
 
-Read [references/correction-policy.md](references/correction-policy.md) before changing `transcript.corrected.*`.
+Read [references/correction-policy.md](references/correction-policy.md) before changing `01_转录文本.txt` or `02_字幕.srt`.
 
 For every disputed interval:
 
@@ -121,8 +168,34 @@ For every disputed interval:
 2. Correct obvious homophones and known proper nouns only when the evidence supports the correction.
 3. Do not choose a phrase merely because it reads better.
 4. If evidence remains insufficient, keep `[听不清 HH:MM:SS]`.
-5. Record the decision and evidence in `transcript.audit.md`.
-6. Edit only `transcript.corrected.txt`, `transcript.corrected.srt`, and the decision column in the audit report. Never edit `raw/`.
+5. Record the decision and evidence in `_审计证据/transcript.audit.md`.
+6. Edit only `01_转录文本.txt`, `02_字幕.srt`, `03_待确认内容.md`, and the decision column in the audit report. Never edit `_审计证据/raw/`.
+
+## Organize Legacy Runs
+
+Older runs with `run.json`, `raw/`, and `source/` at the root remain readable.
+Preview a migration without changing files:
+
+```bash
+pwsh -File "{baseDir}/scripts/asr.ps1" organize "RUN_DIR" --dry-run
+```
+
+```bash
+bash "{baseDir}/scripts/asr.sh" organize "RUN_DIR" --dry-run
+```
+
+Run the migration only after the legacy run validates:
+
+```bash
+pwsh -File "{baseDir}/scripts/asr.ps1" organize "RUN_DIR"
+```
+
+```bash
+bash "{baseDir}/scripts/asr.sh" organize "RUN_DIR"
+```
+
+The command stages and validates the new layout before switching. Repeating it
+on an organized run succeeds without creating another result directory.
 
 ## Validate
 

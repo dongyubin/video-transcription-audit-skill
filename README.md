@@ -174,7 +174,27 @@ bash scripts/asr.sh prepare-audit "/data/transcripts/示例" --secondary auto
 
 `--secondary` 可选 `auto`、`sensevoice`、`telespeech` 或 `local-small`。
 
-### 4. 验证结果
+### 4. 可视化校订
+
+Windows：
+
+```powershell
+pwsh -File scripts/asr.ps1 review "D:\transcripts\示例"
+```
+
+macOS / Linux：
+
+```bash
+bash scripts/asr.sh review "/data/transcripts/示例"
+```
+
+命令会在 `127.0.0.1` 启动临时本地服务并打开浏览器，提供原视频、字幕叠加、波形时间线、文字编辑、起止时间调整、搜索、播放速度和单句循环。运行时不访问 CDN，也不需要 Node。
+
+编辑器直接引用原视频，不复制媒体；原视频移动后可用 `--media "新路径"` 临时指定。原视频缺失时自动降级到已有标准化音频。使用 `--no-open` 可只输出地址，`--port PORT` 可指定本地端口。
+
+修改 `[听不清]` 文本不会自动把它判定为正确，必须在重听后点击“已听清并确认”，对应区间才会从待确认清单移除。第一版不支持新增、删除、拆分或合并字幕。
+
+### 5. 验证结果
 
 ```powershell
 pwsh -File scripts/asr.ps1 validate "D:\transcripts\示例"
@@ -184,32 +204,63 @@ pwsh -File scripts/asr.ps1 validate "D:\transcripts\示例"
 bash scripts/asr.sh validate "/data/transcripts/示例"
 ```
 
+### 6. 整理旧版结果目录
+
+旧版结果仍可直接使用 `validate` 和 `prepare-audit`。迁移前先预览：
+
+```powershell
+pwsh -File scripts/asr.ps1 organize "D:\transcripts\旧版结果" --dry-run
+```
+
+确认后执行：
+
+```powershell
+pwsh -File scripts/asr.ps1 organize "D:\transcripts\旧版结果"
+```
+
+macOS / Linux 将 `pwsh -File scripts/asr.ps1` 换成 `bash scripts/asr.sh`。
+迁移会先在同级临时目录构建并验证新结构，失败时恢复旧目录。对已整理目录重复执行不会创建第二份结果。
+
 ## 输出结构
 
 ```text
 OUTPUT_DIR/
-├── source/
-│   ├── audio_16k.mp3
-│   └── media.json
-├── raw/
-│   ├── <模型>.json
-│   ├── <模型>.txt
-│   ├── <模型>.srt
-│   ├── <模型>.vtt
-│   └── <模型>.tsv
-├── audit-clips/
-├── transcript.corrected.txt
-├── transcript.corrected.srt
-├── transcript.audit.md
-└── run.json
+├── 01_转录文本.txt
+├── 02_字幕.srt
+├── 03_待确认内容.md
+└── _审计证据/
+    ├── source/
+    │   ├── audio_16k.mp3
+    │   └── media.json
+    ├── raw/
+    │   ├── <模型>.json
+    │   ├── <模型>.txt
+    │   ├── <模型>.srt
+    │   ├── <模型>.vtt
+    │   └── <模型>.tsv
+    ├── audit-clips/
+    ├── audit.json
+    ├── review/
+    │   ├── waveform.u8
+    │   ├── waveform.meta.json
+    │   └── edits.jsonl
+    ├── transcript.audit.md
+    └── run.json
 ```
 
-- `source/`：标准化音频和媒体信息。
-- `raw/`：不可修改的原始模型结果。
-- `audit-clips/`：带上下文的争议区间音频。
-- `transcript.corrected.*`：允许人工继续校订的保守版本。
-- `transcript.audit.md`：模型分歧、证据和最终处理记录。
-- `run.json`：环境、模型、设备、耗时、降级和原始文件哈希。
+- `01_转录文本.txt`：用户直接阅读的最终文本。
+- `02_字幕.srt`：可导入播放器或剪辑软件的最终字幕。
+- `03_待确认内容.md`：只列仍需人工确认的区间、模型候选和争议音频链接；没有争议时明确写“无需人工确认”。
+- `_审计证据/`：程序和专业复核使用的内部材料，普通用户通常不需要打开。
+- `_审计证据/raw/`：不可修改的原始模型结果。
+- `_审计证据/audit-clips/`：带前后文的争议区间音频。
+- `_审计证据/audit.json`：可视化编辑器使用的机器可读审计区间。
+- `_审计证据/review/waveform.u8`：每秒 20 个峰值的紧凑波形缓存，一小时约 72 KB。
+- `_审计证据/review/edits.jsonl`：每次成功保存的文字、时间和确认变更。
+- `_审计证据/transcript.audit.md`：完整模型分歧、证据和处理记录。
+- `_审计证据/run.json`：环境、模型、设备、降级和原始文件哈希。
+
+省略 `--audit` 时仍生成三个用户文件；`03_待确认内容.md` 会标明尚未执行多模型审计。
 
 ## 校订原则
 
@@ -217,7 +268,7 @@ OUTPUT_DIR/
 2. 只有专有名词证据、模型共识或清晰音频上下文支持时才修改。
 3. 不能因为一句话“更通顺”就认定它是原话。
 4. 无法可靠确认时保留 `[听不清 HH:MM:SS]`。
-5. 每次修改都应在 `transcript.audit.md` 中说明证据。
+5. 每次修改都应在 `_审计证据/transcript.audit.md` 中说明证据，并同步更新 `03_待确认内容.md`。
 
 详细规则见 [references/correction-policy.md](references/correction-policy.md)。
 
@@ -236,14 +287,16 @@ OUTPUT_DIR/
 - FFmpeg 和 FFprobe。
 - NVIDIA 本地加速需要 CUDA 12 与 cuDNN 9 兼容运行库。
 - Apple Silicon 使用 `mlx-whisper`。
+- 可视化校订支持现代 Chrome、Edge、Firefox 和 Safari；Windows Chrome/Edge 已实机验证。
 
 安装或 GPU 加载失败时见 [references/platforms.md](references/platforms.md)。
 
-当前自动化测试覆盖后端/profile 选择、显存与计算类型、依赖版本、镜像测速、中文路径、云端重试、SRT 和原始文件哈希。Windows 实机还验证了：
+当前自动化测试覆盖后端/profile 选择、显存与计算类型、依赖版本、镜像测速、中文路径、云端重试、SRT、波形缓存、HTTP Range、并发修改冲突、保存回滚和原始文件哈希。Windows 实机还验证了：
 
 - CTranslate2 识别到 CUDA 设备并返回支持的计算类型。
 - 设置 `PIP_NO_INDEX=1` 后重复运行安装器仍成功，且 `pip freeze` 不变。
 - 删除单个依赖后只修复该 requirement，不重复处理 NVIDIA 依赖组。
+- 当前 17 分钟视频直接复用原媒体，波形缓存为约 20 KB，浏览器可完成筛选、修改、明确确认、保存和再次验证。
 
 ## 硅基流动分段与重试
 
